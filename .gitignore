@@ -1,0 +1,24 @@
+# Python 虚拟环境
+venv/
+env/
+.venv/
+
+# 编译文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 日志文件
+*.log
+
+# IDE/编辑器配置
+.idea/
+.vscode/
+
+# 图片视频资源文件
+*.img
+*.jpg
+*.jpeg
+*.mp4
+*.png
