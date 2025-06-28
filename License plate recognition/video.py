@@ -2,51 +2,28 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 from paddleocr import PaddleOCR
-import re
 from collections import defaultdict, Counter
 from PIL import ImageFont, ImageDraw, Image
 
+# 模型路径
 model_path = r"D:\code\Python\License plate recognition\License plate recognition\runs\detect\train\weights\best.pt"
 
-ocr = PaddleOCR(use_angle_cls=True, lang="ch")
+# OCR 模型（轻量模式）
+ocr = PaddleOCR(use_angle_cls=False, lang="ch")
+
+# YOLO 加载
 yolo_model = YOLO(model_path, task='detect')
 
-def high_reserve(img, ksize, sigm):
-    img = img * 1.0
-    gauss_out = cv2.GaussianBlur(img, (ksize, ksize), sigm)
-    img_out = img - gauss_out + 128
-    img_out = img_out / 255.0
-    img_out = np.clip(img_out, 0, 1)
-    return img_out
-
-def usm(img, number):
-    blur_img = cv2.GaussianBlur(img, (0, 0), number)
-    return cv2.addWeighted(img, 1.5, blur_img, -0.5, 0)
-
-def Overlay(target, blend):
-    mask = blend < 0.5
-    return 2 * target * blend * mask + (1 - mask) * (1 - 2 * (1 - target) * (1 - blend))
-
+# 绘制中文文字
 def draw_chinese_text(img, text, position, font_size=30, color=(0, 255, 0)):
     img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
-
-    # 指定中文字体路径（可按需修改）
-    font_path = "C:/Windows/Fonts/simhei.ttf"  # 或使用 NotoSansCJK-Regular.ttc 等
+    font_path = "C:/Windows/Fonts/simhei.ttf"  # 中文字体
     font = ImageFont.truetype(font_path, font_size)
-
-    draw.text(position, text, font=font, fill=color[::-1])  # RGB 反转为 BGR
+    draw.text(position, text, font=font, fill=color[::-1])  # BGR to RGB
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-# 打开视频
-video_path = "D:\code\Python\License plate recognition\stream.mp4"
-cap = cv2.VideoCapture(video_path)
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter('output.mp4', fourcc, 25.0, (int(cap.get(3)), int(cap.get(4))))
-
-plate_history = defaultdict(list)
-prev_boxes = []
-
+# IOU计算
 def iou(box1, box2):
     xi1 = max(box1[0], box2[0])
     yi1 = max(box1[1], box2[1])
@@ -58,30 +35,56 @@ def iou(box1, box2):
     union_area = box1_area + box2_area - inter_area
     return inter_area / union_area if union_area != 0 else 0
 
+# 视频路径
+video_path = "D:\code\Python\License plate recognition\static_stream.mp4"
+cap = cv2.VideoCapture(video_path)
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter('output.mp4', fourcc, 25.0, (int(cap.get(3)), int(cap.get(4))))
+
+plate_history = defaultdict(list)
+prev_boxes = []
+
 frame_id = 0
+skip_rate = 5  # 每 5 帧处理一次
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
+    frame_id += 1
+    if frame_id % skip_rate != 0:
+        out.write(frame)
+        continue
+
     results = yolo_model(frame)
     boxes = results[0].boxes.xyxy.cpu().numpy()
-
     current_boxes = []
 
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = map(int, box[:4])
         cropped = frame[y1:y2, x1:x2]
-
         if cropped.shape[0] < 10 or cropped.shape[1] < 10:
             continue
 
-        img_gas = cv2.GaussianBlur(cropped, (3, 3), 1.5)
-        high = high_reserve(img_gas, 11, 5)
-        usm1 = usm(high, 11)
-        enhanced = (Overlay(img_gas / 255, usm1) * 255).astype(np.uint8)
-        enhanced = cv2.resize(enhanced, (256, 64))
+        # 简单 resize，取消复杂图像增强
+        enhanced = cv2.resize(cropped, (256, 64))
 
+        # OCR
+        ocr_result = ocr.ocr(enhanced, cls=False)
+        plate_text = ""
+        if ocr_result and isinstance(ocr_result[0], list):
+            try:
+                for line in ocr_result:
+                    for word in line:
+                        text, conf = word[1]
+                        if conf > 0.7:
+                            plate_text += text
+                plate_text = plate_text.replace("·", "")
+            except:
+                plate_text = ""
+
+        # ID匹配与投票
         matched = False
         for j, pbox in enumerate(prev_boxes):
             if iou(box, pbox) > 0.5:
@@ -91,19 +94,6 @@ while cap.isOpened():
         if not matched:
             box_id = len(plate_history)
 
-        ocr_result = ocr.ocr(enhanced, cls=True)
-        plate_text = ""
-        if ocr_result and isinstance(ocr_result[0], list):
-            try:
-                for line in ocr_result:
-                    for word in line:
-                        text, conf = word[1]
-                        if conf > 0.7:
-                            plate_text += text
-                plate_text = plate_text.replace("·", "")[:7]
-            except:
-                plate_text = ""
-
         if plate_text:
             plate_history[box_id].append(plate_text)
             if len(plate_history[box_id]) > 10:
@@ -112,10 +102,10 @@ while cap.isOpened():
         voted_text = ""
         if plate_history[box_id]:
             voted_text = Counter(plate_history[box_id]).most_common(1)[0][0]
+            if voted_text and not voted_text.startswith("川"):
+                voted_text = "川" + voted_text
 
-            if voted_text:
-                voted_text = "川" + voted_text[1:]
-
+        # 显示识别结果
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
         if voted_text:
             frame = draw_chinese_text(frame, voted_text, (x1, y1 - 30))
@@ -124,9 +114,9 @@ while cap.isOpened():
 
     prev_boxes = current_boxes
 
+    # 显示和写出
     cv2.imshow("License Plate Recognition", frame)
     out.write(frame)
-    frame_id += 1
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break

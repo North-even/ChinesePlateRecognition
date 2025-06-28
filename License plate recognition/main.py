@@ -1,5 +1,4 @@
 import re
-
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -13,11 +12,12 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 
 # 路径配置
 model_path = r"D:\code\Python\License plate recognition\License plate recognition\runs\detect\train\weights\best.pt"
-img_path = r"D:\code\Python\val150\val\33.jpg"
+img_path = r"C:\Users\Northeven\Desktop\forShow\82.jpg"
 
 # 初始化模型
 ocr = PaddleOCR(use_angle_cls=True, lang="ch")
 yolo_model = YOLO(model_path, task='detect')
+
 
 # 图像处理函数
 def high_reserve(img, ksize, sigm):
@@ -32,21 +32,25 @@ def high_reserve(img, ksize, sigm):
     img_out = img_out * (1 - mask_2) + mask_2
     return img_out
 
+
 def usm(img, number):
     blur_img = cv2.GaussianBlur(img, (0, 0), number)
     usm = cv2.addWeighted(img, 1.5, blur_img, -0.5, 0)
     return usm
+
 
 def Overlay(target, blend):
     mask = blend < 0.5
     img = 2 * target * blend * mask + (1 - mask) * (1 - 2 * (1 - target) * (1 - blend))
     return img
 
+
 # 加载图像
 original_image = cv2.imread(img_path)
 if original_image is None:
     print("❌ 图像读取失败")
     exit()
+
 
 # 车牌颜色识别（1=蓝，0=绿）
 def detect_plate_color(img):
@@ -57,15 +61,37 @@ def detect_plate_color(img):
     green_ratio = np.sum(green_mask > 0) / (img.shape[0] * img.shape[1])
     return 1 if blue_ratio > green_ratio else 0
 
+
 # 透视变换
 def four_point_transform(image, pts):
-    rect = np.array(pts, dtype="float32")
-    width = int(np.linalg.norm(rect[1] - rect[0]))
-    height = int(np.linalg.norm(rect[3] - rect[0]))
-    dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype="float32")
+    # 对四个点进行排序：左上，右上，右下，左下
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+
+    (tl, tr, br, bl) = rect
+    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+    maxWidth = max(int(widthA), int(widthB))
+
+    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+    maxHeight = max(int(heightA), int(heightB))
+
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]], dtype="float32")
+
     M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (width, height))
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
     return warped
+
 
 # 执行 YOLO 检测
 results = yolo_model(img_path)
@@ -73,32 +99,57 @@ results = yolo_model(img_path)
 # 遍历每个车牌框
 for box in results[0].boxes.xyxy:
     x1, y1, x2, y2 = map(int, box[:4])
-    padding = 10
+    padding = 5
     x1, y1 = max(x1 - padding, 0), max(y1 - padding, 0)
     x2, y2 = min(x2 + padding, original_image.shape[1]), min(y2 + padding, original_image.shape[0])
 
     cropped = original_image[y1:y2, x1:x2]
 
-    # 图像处理（高分辨率增强）
-    img_gas = cv2.GaussianBlur(cropped, (3, 3), 1.5)
+    # --- 新增：透视矫正逻辑 ---
+    warped = cropped  # 默认情况下，矫正图就是裁剪图
+    try:
+        # 1. 图像预处理，寻找轮廓
+        gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # 2. 找到最大的轮廓，认为它就是车牌
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+
+            # 3. 计算包围最大轮廓的最小旋转矩形
+            rect = cv2.minAreaRect(largest_contour)
+
+            # 4. 获取矩形的四个顶点，并转换回原图坐标系
+            box_corners = cv2.boxPoints(rect)
+            box_corners = np.intp(box_corners + [x1, y1])  # 转换回原图坐标
+
+            # 5. 使用这四个角点进行透视变换
+            warped = four_point_transform(original_image, box_corners)
+    except:
+        # 如果寻找轮廓或变换失败，则继续使用原始裁剪图
+        print("透视矫正失败，使用原始裁剪区域。")
+        warped = cropped
+    # --- 透视矫正逻辑结束 ---
+
+    # 图像增强（现在对摆正后的图像进行）
+    img_gas = cv2.GaussianBlur(warped, (3, 3), 1.5)
     high = high_reserve(img_gas, 11, 5)
     usm1 = usm(high, 11)
     enhanced = (Overlay(img_gas / 255, usm1) * 255).astype(np.uint8)
 
-    # 判断颜色
+    # 判断颜色（依然用原始裁剪图判断）
     plate_class = detect_plate_color(cropped)
 
-    # 透视矫正（基于原图坐标）
-    pts = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype="float32")
-    warped = four_point_transform(original_image, pts)
-
-    # OCR 识别
+    # OCR 识别 (现在对增强后的、摆正的图像进行)
     ocr_result = ocr.ocr(enhanced, cls=True)
     plate_text = "".join([word[1][0] for line in ocr_result for word in line])
-    plate_text = plate_text.replace("·", "")  # 去除·
-    plate_text = plate_text.replace("-", "")  # 去除-
-    plate_text = re.sub(r'[iI]', '1', plate_text)  # 将 i 或 I 替换为 1
-    plate_text = re.sub(r'[oO]', '0', plate_text)  # 将 o 或 O 替换为 0
+    plate_text = plate_text.replace("·", "")
+    plate_text = plate_text.replace("-", "")
+    plate_text = re.sub(r'[iI]', '1', plate_text)
+    plate_text = re.sub(r'[oO]', '0', plate_text)
 
     # 保留字符数量
     plate_text = plate_text[:7] if plate_class == 1 else plate_text[:8]
@@ -107,19 +158,22 @@ for box in results[0].boxes.xyxy:
     print(f"识别结果: {plate_text}，颜色类别: {'蓝牌(1)' if plate_class == 1 else '绿牌(0)'}")
 
     # 显示图像
-    plt.figure(figsize=(12, 4))
+    plt.figure(figsize=(15, 5))
 
     plt.subplot(1, 3, 1)
     plt.imshow(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
     plt.title("原始车牌区域")
+    plt.axis('off')
 
     plt.subplot(1, 3, 2)
-    plt.imshow(cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB))
-    plt.title("增强后的图像")
+    plt.imshow(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
+    plt.title("透视矫正后")
+    plt.axis('off')
 
     plt.subplot(1, 3, 3)
-    plt.imshow(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
-    plt.title(f"OCR识别结果: {plate_text}")
+    plt.imshow(cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB))
+    plt.title(f"增强后 OCR识别: {plate_text}")
+    plt.axis('off')
 
     plt.tight_layout()
     plt.show()
