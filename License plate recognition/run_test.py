@@ -1,59 +1,68 @@
-import os
 import re
+import os
 import cv2
 import numpy as np
-import csv
 from ultralytics import YOLO
 from paddleocr import PaddleOCR
-from PIL import ImageFont, ImageDraw, Image
 import matplotlib.pyplot as plt
 import matplotlib
 
-# --- 1. 配置区域 (请根据您的实际情况修改) ---
-
-# Matplotlib 中文支持 (确保您的系统已安装黑体 'SimHei')
+# Matplotlib 中文支持
 matplotlib.rcParams['font.sans-serif'] = ['SimHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 # 路径配置
-MODEL_PATH = r"D:\code\Python\License plate recognition\License plate recognition\runs\detect\train\weights\best.pt"
-# 第一个测试集
-TEST_SET_DIR_1 = r"D:\code\Python\val150\val"
-# 第二个测试集 (CLPD)
-TEST_SET_DIR_2 = r"D:\code\Python\License plate recognition\CLPD_1200"
-# 统一的结果输出文件夹路径
-OUTPUT_DIR = r"D:\test_results"
-# 第二个测试集的CSV结果文件名
-CSV_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "CLPD_recognition_results.csv")
+model_path = r"D:\code\Python\License plate recognition\License plate recognition\runs\detect\train\weights\best.pt"
+input_folder = r"D:\code\Python\val150\val"
+output_folder = r"D:\testResult\150"
 
-# --- 2. 初始化模型 (只需执行一次) ---
+# 创建输出文件夹
+os.makedirs(output_folder, exist_ok=True)
 
-print("正在初始化AI模型，请稍候...")
-try:
-    ocr = PaddleOCR(use_angle_cls=True, lang="ch")
-    yolo_model = YOLO(MODEL_PATH, task='detect')
-    print("✅ 模型初始化成功！")
-except Exception as e:
-    print(f"❌ 模型初始化失败: {e}")
-    exit()
+# 初始化模型
+ocr = PaddleOCR(use_angle_cls=True, lang="ch")
+yolo_model = YOLO(model_path, task='detect')
 
 
-# --- 3. 核心处理函数 ---
+# 图像处理函数
+def high_reserve(img, ksize, sigm):
+    img = img * 1.0
+    gauss_out = cv2.GaussianBlur(img, (ksize, ksize), sigm)
+    img_out = img - gauss_out + 128
+    img_out = img_out / 255.0
+    # 饱和处理
+    mask_1 = img_out < 0
+    mask_2 = img_out > 1
+    img_out = img_out * (1 - mask_1)
+    img_out = img_out * (1 - mask_2) + mask_2
+    return img_out
 
-def draw_chinese_text(img, text, position, font_size=50, color=(0, 255, 0)):
-    """在图像上绘制中文字符。"""
-    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(img_pil)
-    try:
-        font = ImageFont.truetype("simhei.ttf", font_size, encoding="utf-8")
-    except IOError:
-        font = ImageFont.load_default()
-    draw.text(position, text, font=font, fill=color[::-1])
-    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+def usm(img, number):
+    blur_img = cv2.GaussianBlur(img, (0, 0), number)
+    usm = cv2.addWeighted(img, 1.5, blur_img, -0.5, 0)
+    return usm
 
 
+def Overlay(target, blend):
+    mask = blend < 0.5
+    img = 2 * target * blend * mask + (1 - mask) * (1 - 2 * (1 - target) * (1 - blend))
+    return img
+
+
+# 车牌颜色识别（1=蓝，0=绿）
+def detect_plate_color(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    blue_mask = cv2.inRange(hsv, (100, 50, 50), (140, 255, 255))
+    green_mask = cv2.inRange(hsv, (35, 50, 50), (85, 255, 255))
+    blue_ratio = np.sum(blue_mask > 0) / (img.shape[0] * img.shape[1])
+    green_ratio = np.sum(green_mask > 0) / (img.shape[0] * img.shape[1])
+    return 1 if blue_ratio > green_ratio else 0
+
+
+# 透视变换
 def four_point_transform(image, pts):
-    """对图像进行透视变换（摆正）。"""
+    # 对四个点进行排序：左上，右上，右下，左下
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -61,136 +70,157 @@ def four_point_transform(image, pts):
     diff = np.diff(pts, axis=1)
     rect[1] = pts[np.argmin(diff)]
     rect[3] = pts[np.argmax(diff)]
+
     (tl, tr, br, bl) = rect
     widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
     widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
     maxWidth = max(int(widthA), int(widthB))
+
     heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
     heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
     maxHeight = max(int(heightA), int(heightB))
-    dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
+
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]], dtype="float32")
+
     M = cv2.getPerspectiveTransform(rect, dst)
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
     return warped
 
 
-def process_and_save_image(img_path, output_folder):
-    """处理单张图片，保存结果图，并返回识别结果文本。"""
-    print(f"--- 正在处理: {img_path} ---")
-    base_name = os.path.splitext(os.path.basename(img_path))[0]
-    original_image = cv2.imread(img_path)
+# 获取文件夹中的所有图片文件（按文件名排序）
+def get_image_files(folder):
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+    files = [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))
+             and f.lower().endswith(tuple(image_extensions))]
+    # 按文件名排序（确保1,2,3...顺序）
+    files.sort(key=lambda x: int(re.findall(r'\d+', x)[0]) if re.findall(r'\d+', x) else 0)
+    return files
+
+
+# 处理单张图片
+def process_image(image_path, output_folder, index):
+    # 加载图像
+    original_image = cv2.imread(image_path)
     if original_image is None:
-        print(f"❌ 图像读取失败: {img_path}")
-        return "读取失败"
+        print(f"❌ 图像读取失败: {image_path}")
+        return
 
+    file_name = os.path.basename(image_path)
+
+    # 执行 YOLO 检测
     results = yolo_model(original_image)
-    localization_result_img = original_image.copy()
 
-    plate_text_result = "未检测到车牌"
+    # 遍历每个车牌框
+    for i, box in enumerate(results[0].boxes.xyxy):
+        x1, y1, x2, y2 = map(int, box[:4])
+        padding = 5
+        x1, y1 = max(x1 - padding, 0), max(y1 - padding, 0)
+        x2, y2 = min(x2 + padding, original_image.shape[1]), min(y2 + padding, original_image.shape[0])
 
-    if len(results[0].boxes) > 0:
-        best_box_data = results[0].boxes[0]
-        x1, y1, x2, y2 = map(int, best_box_data.xyxy[0])
-        cropped_plate = original_image[y1:y2, x1:x2]
+        cropped = original_image[y1:y2, x1:x2]
 
-        warped_plate = cropped_plate
+        # --- 透视矫正逻辑 ---
+        warped = cropped  # 默认情况下，矫正图就是裁剪图
         try:
-            gray = cv2.cvtColor(cropped_plate, cv2.COLOR_BGR2GRAY)
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            # 1. 图像预处理，寻找轮廓
+            gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+            # 2. 找到最大的轮廓，认为它就是车牌
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
             if contours:
                 largest_contour = max(contours, key=cv2.contourArea)
+
+                # 3. 计算包围最大轮廓的最小旋转矩形
                 rect = cv2.minAreaRect(largest_contour)
-                box_corners = np.intp(cv2.boxPoints(rect))
-                warped_plate = four_point_transform(cropped_plate, box_corners)
-        except Exception as e:
-            print(f"   - 透视矫正失败: {e}")
 
-        ocr_result = ocr.ocr(warped_plate, cls=True)
+                # 4. 获取矩形的四个顶点，并转换回原图坐标系
+                box_corners = cv2.boxPoints(rect)
+                box_corners = np.intp(box_corners + [x1, y1])  # 转换回原图坐标
+
+                # 5. 使用这四个角点进行透视变换
+                warped = four_point_transform(original_image, box_corners)
+        except:
+            # 如果寻找轮廓或变换失败，则继续使用原始裁剪图
+            print(f"⚠️ {file_name} 透视矫正失败，使用原始裁剪区域")
+            warped = cropped
+        # --- 透视矫正逻辑结束 ---
+
+        # 图像增强（现在对摆正后的图像进行）
+        img_gas = cv2.GaussianBlur(warped, (3, 3), 1.5)
+        high = high_reserve(img_gas, 11, 5)
+        usm1 = usm(high, 11)
+        enhanced = (Overlay(img_gas / 255, usm1) * 255).astype(np.uint8)
+
+        # 判断颜色（依然用原始裁剪图判断）
+        plate_class = detect_plate_color(cropped)
+
+        # OCR 识别 (现在对增强后的、摆正的图像进行)
+        ocr_result = ocr.ocr(enhanced, cls=True)
         plate_text = ""
-        if ocr_result and ocr_result[0] is not None:
-            plate_text = "".join([line[1][0] for line in ocr_result[0] if line])
-            plate_text = re.sub(r'[·\-]', '', plate_text).upper()
-            plate_text = re.sub(r'I', '1', plate_text)
-            plate_text = re.sub(r'O', '0', plate_text)
+        # 解决NoneType错误：先判断识别结果是否有效
+        if ocr_result is not None:
+            try:
+                plate_text = "".join([word[1][0] for line in ocr_result for word in line])
+                plate_text = plate_text.replace("·", "")
+                plate_text = plate_text.replace("-", "")
+                plate_text = re.sub(r'[iI]', '1', plate_text)
+                plate_text = re.sub(r'[oO]', '0', plate_text)
+                # 保留字符数量
+                plate_text = plate_text[:7] if plate_class == 1 else plate_text[:8]
+            except:
+                plate_text = "识别失败"
+        else:
+            plate_text = "识别失败"
 
-        plate_text_result = plate_text if plate_text else "未识别出文字"
-        print(f"   > 识别结果: {plate_text_result}")
+        # 输出信息
+        print(f"处理文件: {file_name}, 识别结果: {plate_text}，颜色类别: {'蓝牌(1)' if plate_class == 1 else '绿牌(0)'}")
 
-        cv2.rectangle(localization_result_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
-        localization_result_img = draw_chinese_text(localization_result_img, plate_text, (x1, y1 - 60), font_size=50,
-                                                    color=(0, 0, 255))
+        # 显示图像
+        plt.figure(figsize=(15, 5))
 
-        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-        axs[0].imshow(cv2.cvtColor(cropped_plate, cv2.COLOR_BGR2RGB));
-        axs[0].set_title("原始车牌区域");
-        axs[0].axis('off')
-        axs[1].imshow(cv2.cvtColor(warped_plate, cv2.COLOR_BGR2RGB));
-        axs[1].set_title("透视矫正后");
-        axs[1].axis('off')
-        final_display = draw_chinese_text(warped_plate.copy(), plate_text, (10, 10), font_size=40, color=(255, 0, 0))
-        axs[2].imshow(cv2.cvtColor(final_display, cv2.COLOR_BGR2RGB));
-        axs[2].set_title(f"OCR识别结果: {plate_text}");
-        axs[2].axis('off')
+        plt.subplot(1, 3, 1)
+        plt.imshow(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+        plt.title("原始车牌区域")
+        plt.axis('off')
+
+        plt.subplot(1, 3, 2)
+        plt.imshow(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
+        plt.title("透视矫正后")
+        plt.axis('off')
+
+        plt.subplot(1, 3, 3)
+        plt.imshow(cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB))
+        plt.title(f"增强后 OCR识别: {plate_text}")
+        plt.axis('off')
+
         plt.tight_layout()
-        recognition_path = os.path.join(output_folder, f"{base_name}-识别.jpg")
-        plt.savefig(recognition_path);
-        plt.close(fig)
-        print(f"   ✔️ 已保存识别过程图: {recognition_path}")
 
-    else:
-        print("   - 未检测到任何车牌。")
-
-    localization_path = os.path.join(output_folder, f"{base_name}-定位.jpg")
-    cv2.imencode('.jpg', localization_result_img)[1].tofile(localization_path)
-    print(f"   ✔️ 已保存定位结果图: {localization_path}")
-
-    return plate_text_result
+        # 保存图像（命名格式：序号-识别.png）
+        output_name = f"{index}-识别.png"
+        output_path = os.path.join(output_folder, output_name)
+        plt.savefig(output_path)
+        plt.close()  # 关闭图形以释放内存
 
 
-# --- 4. 主执行逻辑 ---
-if __name__ == '__main__':
-    test_sets = {
-        'test_set_1': TEST_SET_DIR_1,
-        'CLPD_1200': TEST_SET_DIR_2  # 使用一个有意义的名字
-    }
+# 主函数：遍历文件夹中的所有图片
+def main():
+    image_files = get_image_files(input_folder)
+    print(f"找到 {len(image_files)} 张图片，开始处理...")
 
-    csv_results = []
+    for i, image_file in enumerate(image_files, start=1):  # 从1开始计数
+        print(f"\n处理第 {i}/{len(image_files)} 张图片: {image_file}")
+        image_path = os.path.join(input_folder, image_file)
+        process_image(image_path, output_folder, i)  # 传入序号作为参数
 
-    for set_name, test_dir in test_sets.items():
-        if not test_dir or not os.path.isdir(test_dir):
-            continue
+    print("\n所有图片处理完成!")
 
-        print(f"\n===== 开始处理测试集: {set_name} ({test_dir}) =====")
 
-        test_set_output_folder = os.path.join(OUTPUT_DIR, set_name)
-        os.makedirs(test_set_output_folder, exist_ok=True)
-
-        image_files = [f for f in os.listdir(test_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        try:
-            image_files.sort(key=lambda f: int(re.search(r'\d+', f).group()))
-        except (AttributeError, ValueError):
-            image_files.sort()
-            print(f"⚠️ 文件夹 {test_dir} 中的文件名不包含数字，将按默认字母顺序处理。")
-
-        for image_name in image_files:
-            image_path = os.path.join(test_dir, image_name)
-            result_text = process_and_save_image(image_path, test_set_output_folder)
-
-            # 【新增逻辑】: 如果当前是CLPD测试集，则记录结果
-            if set_name == 'CLPD_1200':
-                csv_results.append([image_name, result_text])
-
-    # 【新增逻辑】: 在所有图片处理完成后，写入CSV文件
-    if csv_results:
-        print(f"\n正在将CLPD测试集的结果写入CSV文件: {CSV_OUTPUT_PATH} ...")
-        try:
-            with open(CSV_OUTPUT_PATH, mode='w', newline='', encoding='utf-8-sig') as f:
-                writer = csv.writer(f)
-                writer.writerow(["图片名", "车牌识别结果"])  # 写入表头
-                writer.writerows(csv_results)
-            print(f"✅ CSV文件保存成功！")
-        except Exception as e:
-            print(f"❌ 保存CSV文件失败: {e}")
-
-    print("\n🎉🎉🎉 全部处理完成！ 🎉🎉🎉")
+if __name__ == "__main__":
+    main()
